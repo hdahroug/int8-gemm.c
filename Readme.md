@@ -58,17 +58,6 @@ error. 6592,-4917,0
 ====Kernel-Passed-against-naive====
 ```
 
-## Repo Structure
-
-```
-src/                      -- main kernel, micro-kernel, packing, bias correction
-autotuner/                -- grid search for MC, KC, NC tile sizes
-benchmarks/               -- Google Benchmark harness vs oneDNN
-learning-phase-kernels/   -- iterative development kernels showing the optimization steps
-scripts/                  -- build, test, and benchmark scripts
-.github/workflows/        -- CI: runs benchmark and correctness check on every push
-```
-
 ## How It Works
 
 Full walkthrough of every design decision, from cache hierarchy to the register layout to the bias correction math: [Advanced INT8 GEMM Optimization on AVX2: 98% of Intel's oneDNN](https://hdahroug.github.io/optimizing-int8-gemm-avx2/)
