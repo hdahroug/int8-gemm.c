@@ -17,6 +17,7 @@ Benchmarks run automatically on every push via GitHub Actions. Results vary by r
 **5-loop BLIS-style blocking.** The outer three loops tile M, N, K to fit panels into L3, L2, and L1 respectively. The innermost 6x16 micro-kernel works entirely from packed buffers already in L1 and registers.
 
 **6x16 micro-kernel.** On AVX2 with 16 YMM registers: 12 accumulators for C, 2 for B, 1 for the A broadcast, 1 for the ones constant. 96 results per iteration, all 16 registers used, no register spilling.
+
 ![benchmark](micro-kernel.png)
 
 **Signed-to-unsigned domain shift.** AVX2 only has `_mm256_maddubs_epi16` which requires unsigned times signed. `pack_A` converts s8 to u8 via `^ 0x80` (adding 128), then a vectorized correction subtracts `128 * col_sum(B)` from the output. This also steers intermediate products away from the INT16 saturation boundary that oneDNN hits.
