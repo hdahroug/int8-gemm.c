@@ -1,0 +1,211 @@
+name: Benchmark INT8 GEMM Performance AVX2
+
+on:
+  push:
+    branches: [ tempo ]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/benchmark.yml') }}
+          restore-keys: apt-${{ runner.os }}-
+
+      - name: Cache Intel MKL
+        id: cache-mkl
+        uses: actions/cache@v4
+        with:
+          path: /opt/intel/oneapi
+          key: mkl-oneapi-ubuntu22-2025
+          restore-keys: mkl-oneapi-ubuntu22-
+
+      - name: Print CPU info and Setup Environment
+        run: |
+          CPU_NAME=$(lscpu | grep "Model name" | cut -d':' -f2 | xargs)
+          echo "CPU_MODEL=$CPU_NAME" >> $GITHUB_ENV
+          echo "NCORES=$(nproc)"     >> $GITHUB_ENV
+          
+          # --- NEW: Check for AVX-512 Support ---
+          if lscpu | grep -iq "avx512"; then
+            echo "HAS_AVX512=true" >> $GITHUB_ENV
+            echo "AVX-512 Support Detected: YES"
+          else
+            echo "HAS_AVX512=false" >> $GITHUB_ENV
+            echo "AVX-512 Support Detected: NO"
+          fi
+          
+          # dump full lscpu for the blog / repo docs
+          lscpu > cpu_info.txt
+          cat cpu_info.txt
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            gcc g++ libgomp1 python3-pip \
+            libdnnl-dev libbenchmark-dev \
+            linux-tools-common linux-tools-generic
+          if ! command -v perf &>/dev/null; then
+            PERF_BIN=$(find /usr/lib/linux-tools -name perf 2>/dev/null | head -1)
+            [ -n "$PERF_BIN" ] && sudo ln -sf "$PERF_BIN" /usr/local/bin/perf
+          fi
+          sudo sh -c 'echo 0 > /proc/sys/kernel/perf_event_paranoid'
+          sudo sh -c 'echo 0 > /proc/sys/kernel/kptr_restrict'
+
+      - name: Install Intel MKL
+        if: steps.cache-mkl.outputs.cache-hit != 'true'
+        run: |
+          wget -qO /tmp/intel-gpg.pub \
+            https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+          sudo gpg --dearmor -o /usr/share/keyrings/intel-oneapi.gpg /tmp/intel-gpg.pub
+          echo "deb [signed-by=/usr/share/keyrings/intel-oneapi.gpg] \
+            https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update -qq
+          sudo apt-get install -y intel-oneapi-mkl-devel
+
+      - name: Capture oneAPI Environment
+        shell: bash
+        run: |
+          SNAP_BEFORE=$(mktemp)
+          env | sort > "$SNAP_BEFORE"
+
+          CHILD_ENV=$(
+            env -i \
+              HOME="$HOME" \
+              PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+              TERM="${TERM:-dumb}" \
+              bash --norc --noprofile -c '
+                source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+                env
+              '
+          )
+          CHILD_EXIT=$?
+          if [ $CHILD_EXIT -ne 0 ]; then
+            echo "ERROR: setvars.sh failed: $CHILD_EXIT"
+            echo "$CHILD_ENV"
+            exit $CHILD_EXIT
+          fi
+
+          SNAP_AFTER=$(mktemp)
+          echo "$CHILD_ENV" | sort > "$SNAP_AFTER"
+
+          comm -13 "$SNAP_BEFORE" "$SNAP_AFTER" | while IFS= read -r LINE; do
+            KEY="${LINE%%=*}"
+            VALUE="${LINE#*=}"
+            case "$KEY" in
+              BASH_*|BASHOPTS|SHELLOPTS|PPID|SHLVL|_|OLDPWD|TERM|HOME) continue ;;
+              LD_LIBRARY_PATH|LIBRARY_PATH) continue ;;
+            esac
+            printf '%s<<%s\n%s\n%s\n' \
+              "$KEY" "__ONEAPI_DELIM__" "$VALUE" "__ONEAPI_DELIM__" \
+              >> "$GITHUB_ENV"
+          done
+
+          rm -f "$SNAP_BEFORE" "$SNAP_AFTER"
+
+          MKL_ROOT_VAL=$(echo "$CHILD_ENV" | grep '^MKLROOT=' | cut -d= -f2-)
+          MKL_SO=$(find "$MKL_ROOT_VAL" -name "libmkl_rt.so" 2>/dev/null | head -1)
+          MKL_LIB=$(dirname "$MKL_SO")
+          echo "MKL_LIB_PATH=$MKL_LIB" >> "$GITHUB_ENV"
+          echo "SETVARS_COMPLETED=1"    >> "$GITHUB_ENV"
+          echo "Capture done. MKLROOT=$MKL_ROOT_VAL  MKL_LIB=$MKL_LIB"
+
+      - name: Install Python packages
+        run: pip3 install matplotlib numpy pandas
+
+      - name: Run autotuner
+        run: |
+          gcc autotuner/autotune.c -I. -O3 -march=core-avx2 -fopenmp -o autotune -lm -lpthread
+          ./autotune | tee autotune_output.txt
+          
+          read BEST_MC BEST_NC BEST_KC BEST_PA1 BEST_PB1 BEST_PA2 BEST_PB2 \
+            < /tmp/autotune_result.txt
+          echo "BEST_MC=$BEST_MC"   >> $GITHUB_ENV
+          echo "BEST_NC=$BEST_NC"   >> $GITHUB_ENV
+          echo "BEST_KC=$BEST_KC"   >> $GITHUB_ENV
+          echo "BEST_PA1=$BEST_PA1" >> $GITHUB_ENV
+          echo "BEST_PB1=$BEST_PB1" >> $GITHUB_ENV
+          echo "BEST_PA2=$BEST_PA2" >> $GITHUB_ENV
+          echo "BEST_PB2=$BEST_PB2" >> $GITHUB_ENV
+
+      - name: Compile and Run All Benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MKL_LIB="$MKL_LIB_PATH"
+          MKL_INC="$MKLROOT/include"
+
+          DEFINES="-DMC=$BEST_MC -DNC=$BEST_NC -DKC=$BEST_KC \
+            -DPREFETCH_A_L1=$BEST_PA1 -DPREFETCH_B_L1=$BEST_PB1 \
+            -DPREFETCH_A_L2=$BEST_PA2 -DPREFETCH_B_L2=$BEST_PB2"
+
+          MKL_STATIC="-L$MKL_LIB \
+            -Wl,--start-group \
+              $MKL_LIB/libmkl_intel_lp64.a \
+              $MKL_LIB/libmkl_gnu_thread.a  \
+              $MKL_LIB/libmkl_core.a        \
+            -Wl,--end-group"
+
+          COMMON_FLAGS="-g -fopenmp -O3 -march=core-avx2 \
+            $DEFINES -I$MKL_INC $MKL_STATIC -ldnnl -lm -lpthread"
+
+          echo "=== Compiling standard kernel ==="
+          gcc src/matmul.c $COMMON_FLAGS -o matmul
+
+          echo "=== Compiling Google Benchmark ==="
+          g++ -O3 -march=core-avx2 -fopenmp \
+            benchmarks/google_benchmark.cpp -o google_bench \
+            $DEFINES -I./src -I$MKL_INC $MKL_STATIC \
+            -lbenchmark -ldnnl -lpthread -lm
+
+          echo "=== Running benchmarks ==="
+          env -i \
+            HOME="$HOME" \
+            PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            OMP_NUM_THREADS="$NCORES" \
+            bash --norc --noprofile -c '
+              set -uo pipefail
+              ./matmul > standard_output.txt 2>&1        || echo "matmul exited: $?"
+
+          ./google_bench \
+                --benchmark_out=google_results.json \
+                --benchmark_out_format=json \
+                --benchmark_filter="BM_MyKernel|BM_OneDNN" \
+                > google_output.txt 2>&1                 || echo "google_bench exited: $?"
+          '
+          echo "=== Benchmark output ==="
+          cat standard_output.txt || true
+
+
+      - name: Plot
+        run: |
+          export CPU_MODEL="${{ env.CPU_MODEL }}"
+          export HAS_AVX512="${{ env.HAS_AVX512 }}" # --- NEW: Pass the flag to Python ---
+          python3 scripts/plot_google.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemm-robust-results
+          path: |
+            standard_results.csv
+            google_results.json
+            google_bench_plot.png
+            standard_output.txt
+            google_output.txt
+            autotune_output.txt
+            cpu_info.txt
