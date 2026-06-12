@@ -2,7 +2,7 @@ name: Benchmark INT8 GEMM Performance AVX2
 
 on:
   push:
-    branches: [ tempo ]
+    branches: [ main ]
   workflow_dispatch:
 
 env:
